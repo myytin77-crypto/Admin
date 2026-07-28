@@ -377,6 +377,11 @@ PYROGRAM_API_HASH = "3385fac9880e285aa2f85c22277a13d1"
 BASE_DIR   = os.getenv("BOT_BASE_DIR", os.path.abspath(".")).rstrip("/")
 LOGS_DIR   = os.path.join(BASE_DIR, "logs")
 DB_FILE    = os.getenv("BOT_DB_FILE", os.path.join(BASE_DIR, "vault.db"))
+# 🔥 FIX: Restart ke baad encryption state persist karne ke liye marker file.
+# /encryptdb ke baad yeh file create hoti hai. Bot restart par isse read karke
+# _DB_IS_PLAINTEXT aur _DB_KEY_PRAGMAS set hote hain — isliye SQLCipher mode
+# automatically activate ho jaata hai (plain sqlite3 galti se use nahi hota).
+_DB_ENCRYPTED_MARKER = DB_FILE + ".enc_config"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # Legacy dirs — only referenced during Grand Migration startup scan
@@ -595,9 +600,74 @@ def _db_file_diagnosis(path: str) -> str:
             "Ho sakta hai ye kisi purani/dusri backup ka password ho — dhyan se dobara sahi password daalo.")
 
 
+def _get_sqlcipher():
+    """
+    🔥 FIX: SQLCipher module ko lazily import karo.
+    pysqlcipher3 ya sqlcipher3 — jo bhi available ho.
+    Dono ka API same hai (PEP 249 compatible).
+    """
+    try:
+        from pysqlcipher3 import dbapi2 as _sc
+        return _sc
+    except ImportError:
+        pass
+    try:
+        import sqlcipher3 as _sc
+        return _sc
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "SQLCipher library nahi mili! "
+        "Install karo: pip install pysqlcipher3 ya pip install sqlcipher3"
+    )
+
+def _load_encryption_state():
+    """
+    🔥 FIX: Bot restart ke baad encryption state recover karo.
+    /encryptdb ke baad _DB_ENCRYPTED_MARKER file create hoti hai.
+    Yahan se pragmas padh ke _DB_IS_PLAINTEXT aur _DB_KEY_PRAGMAS set karo.
+    Agar marker nahi hai → plain sqlite3 mode (default).
+    """
+    global _DB_IS_PLAINTEXT, _DB_KEY_PRAGMAS
+    if not os.path.exists(_DB_ENCRYPTED_MARKER):
+        return  # Plain mode — kuch karne ki zaroorat nahi
+    try:
+        with open(_DB_ENCRYPTED_MARKER, "r") as f:
+            cfg = json.load(f)
+        _DB_IS_PLAINTEXT = False
+        _DB_KEY_PRAGMAS  = cfg.get("pragmas", [])
+        print(f"🔒 [DB] SQLCipher encrypted mode detected (marker: {_DB_ENCRYPTED_MARKER})")
+        print(f"   Pragmas: {_DB_KEY_PRAGMAS}")
+    except Exception as e:
+        print(f"⚠️ [DB] enc_config read nahi hua: {e} — plain mode fallback")
+
+# ── Startup par encryption state load karo ──
+_load_encryption_state()
+
 def _db_connect():
-    """Plain sqlite3 connection — no encryption, maximum speed.
-    WAL mode + cache + mmap for best performance and low RAM."""
+    """
+    DB connection — plain sqlite3 ya SQLCipher, jo bhi mode active hai.
+    🔥 FIX: _DB_IS_PLAINTEXT = False hone par SQLCipher use karta hai
+    (key + cipher pragmas apply karke), taaki restart ke baad encrypted
+    DB properly khul sake aur 'file is not a database' error na aaye.
+    """
+    if not _DB_IS_PLAINTEXT:
+        # ── SQLCipher mode ──
+        if not _DB_KEY:
+            raise RuntimeError("DB key not set. /start se pehle unlock karo.")
+        sc  = _get_sqlcipher()
+        con = sc.connect(DB_FILE, timeout=60, check_same_thread=False)
+        safe_key = _DB_KEY.replace("'", "''")
+        con.execute(f"PRAGMA key='{safe_key}'")
+        for p in _DB_KEY_PRAGMAS:
+            con.execute(p)
+        con.execute("PRAGMA busy_timeout=60000")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-8192")
+        con.execute("PRAGMA temp_store=MEMORY")
+        return con
+    # ── Plain sqlite3 mode ──
     con = sqlite3.connect(DB_FILE, timeout=60, check_same_thread=False)
     con.execute("PRAGMA busy_timeout=60000")   # 60s lock wait
     con.execute("PRAGMA journal_mode=WAL")     # Concurrent reads + writes
@@ -712,13 +782,25 @@ def db_password_set() -> bool:
 
 def db_verify_pw(pw: str) -> bool:
     """
-    Verify admin password against stored scrypt hash in plain sqlite3 DB.
-    No cipher profile probing needed — DB is unencrypted.
+    Verify admin password.
+    🔥 FIX: Plain DB → sqlite3 se seedha pw_hash padhta hai.
+             Encrypted DB → SQLCipher se key+pragmas lagakar padhta hai.
+    Dono cases mein scrypt hash se verify hota hai.
     """
     global _LAST_UNLOCK_DIAGNOSIS
     pw = _normalize_pw(pw)
     try:
-        con = sqlite3.connect(DB_FILE, timeout=10)
+        if _DB_IS_PLAINTEXT:
+            # Plain sqlite3 — seedha connect karo
+            con = sqlite3.connect(DB_FILE, timeout=10)
+        else:
+            # 🔥 FIX: SQLCipher mode — pehle key lagao, phir pragmas, tab query
+            sc  = _get_sqlcipher()
+            con = sc.connect(DB_FILE, timeout=10, check_same_thread=False)
+            safe_key = pw.replace("'", "''")
+            con.execute(f"PRAGMA key='{safe_key}'")
+            for p in _DB_KEY_PRAGMAS:
+                con.execute(p)
         row = con.execute("SELECT value FROM vault_meta WHERE key='pw_hash'").fetchone()
         con.close()
         if row and _scrypt_verify(pw, row[0]):
@@ -773,6 +855,28 @@ def _maybe_upgrade_pw_hash(pw: str):
 #  📦  FILES VAULT — CRUD (replaces scripts/folders/db_files)
 # ══════════════════════════════════════════════════════════════
 # category values: 'script', 'folder_file', 'session', 'dbfile'
+
+def _get_aes_key() -> bytes:
+    """
+    🔥 FIX (Bug #2): _vault_physical_path() se call hota hai lekin pehle define
+    nahi tha → NameError crash har >10MB file save par.
+    _DB_KEY + stored salt se 32-byte HMAC key derive karta hai.
+    Salt vault_meta['aes_key_salt'] mein stored hai (db_set_pw ke waqt create hoti hai).
+    Agar DB unlock nahi hai ya salt nahi mili toh RuntimeError raise hota hai.
+    """
+    if not _DB_KEY:
+        raise RuntimeError("DB unlock nahi hua — _get_aes_key() tab tak call nahi ho sakta.")
+    try:
+        salt_hex = _db_get("aes_key_salt")
+        if not salt_hex:
+            # Salt pehli baar nahi bani thi (purana setup) — create karke save karo
+            salt = os.urandom(32)
+            _db_set("aes_key_salt", salt.hex())
+        else:
+            salt = bytes.fromhex(salt_hex)
+    except Exception as e:
+        raise RuntimeError(f"AES key salt read nahi hua: {e}")
+    return _kdf(_DB_KEY, salt, dklen=32)
 
 def _vault_physical_path(category: str, folder: str, filename: str) -> str:
     """
@@ -993,6 +1097,8 @@ def _grand_migration():
 #  🧠  RAM DISK EXECUTION ENGINE (/dev/shm)
 # ══════════════════════════════════════════════════════════════
 _RAM_MONITORS = {}  # key → monitor thread
+_LAST_SAVED_STATE = {}  # key → {filename: mtime} — auto-save ke liye last saved state
+_AUTOSAVE_STOP_EVT = threading.Event()  # Global auto-save thread ko stop karne ke liye
 
 def _extract_to_ram(category, filename, folder="") -> str:
     """Extract a file from DB to RAM disk. Returns path or None."""
@@ -1005,6 +1111,114 @@ def _extract_to_ram(category, filename, folder="") -> str:
         f.write(data)
     os.chmod(ram_path, 0o700)
     return ram_path
+
+# ══════════════════════════════════════════════════════════════
+#  💾  LIVE DATA SAVE — Script chal rahi ho TAB BHI save karo
+#  (Kill kiye bina — sirf changed/new files vault mein daalta hai)
+# ══════════════════════════════════════════════════════════════
+def _save_running_script_data(key: str, *, notify_chat_id: int = None) -> list:
+    """
+    Ek running script ke RAM folder ke changed/new files ko
+    abhi vault mein save karo — process kill NAHI hoga.
+
+    Returns: list of saved filenames (empty = kuch nahi badla)
+    """
+    info = RUNNING.get(key)
+    if not info:
+        return []
+
+    ram_cwd = os.path.dirname(info.get("ram_path", ""))
+    if not ram_cwd or not os.path.isdir(ram_cwd):
+        return []
+
+    category = info.get("category", "")
+    folder   = info.get("folder", "")
+    last_state = _LAST_SAVED_STATE.get(key, {})
+    saved = []
+
+    try:
+        for fn in os.listdir(ram_cwd):
+            fp = os.path.join(ram_cwd, fn)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                continue
+
+            # Pehle save ke waqt last_state khali hoga → sab save karo
+            if fn not in last_state or mtime > last_state[fn]:
+                try:
+                    with open(fp, "rb") as f:
+                        data = f.read()
+                    vault_save(category, fn, data, folder)
+                    last_state[fn] = mtime
+                    saved.append(fn)
+                    # WAL/SHM hai toh main DB bhi save karo
+                    if fn.endswith("-wal") or fn.endswith("-shm"):
+                        main_db = fn.replace("-wal", "").replace("-shm", "")
+                        main_fp = os.path.join(ram_cwd, main_db)
+                        if os.path.isfile(main_fp) and main_db not in saved:
+                            with open(main_fp, "rb") as f2:
+                                vault_save(category, main_db, f2.read(), folder)
+                            last_state[main_db] = os.path.getmtime(main_fp)
+                            saved.append(main_db)
+                except Exception as e:
+                    log.warning(f"[LiveSave] {key}/{fn}: {e}")
+    except Exception as e:
+        log.warning(f"[LiveSave] {key}: listdir error: {e}")
+
+    _LAST_SAVED_STATE[key] = last_state
+
+    if saved and notify_chat_id:
+        try:
+            bot.send_message(
+                notify_chat_id,
+                f"💾 *Manual Save* — `{info.get('filename',key)}`\n"
+                f"Saved {len(saved)} file(s): " + ", ".join(f"`{s}`" for s in saved),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    return saved
+
+
+def _save_all_running_data(*, log_prefix: str = "Shutdown") -> None:
+    """
+    Saare running scripts ka data abhi vault mein save karo.
+    Script stop / SIGINT / SIGTERM par call hota hai.
+    """
+    keys = list(RUNNING.keys())
+    if not keys:
+        return
+    log.info(f"[{log_prefix}] Saving data for {len(keys)} running script(s)…")
+    for k in keys:
+        try:
+            saved = _save_running_script_data(k)
+            if saved:
+                log.info(f"[{log_prefix}] Saved {len(saved)} file(s) for '{k}'")
+            else:
+                log.info(f"[{log_prefix}] No changes for '{k}'")
+        except Exception as e:
+            log.warning(f"[{log_prefix}] Save failed for '{k}': {e}")
+
+
+def _autosave_loop(interval_seconds: int = 180):
+    """
+    Background thread: har `interval_seconds` baad sabke changed files save karta hai.
+    Default: har 3 minute.
+    """
+    log.info(f"[AutoSave] Thread started — interval: {interval_seconds}s")
+    while not _AUTOSAVE_STOP_EVT.wait(timeout=interval_seconds):
+        if RUNNING:
+            log.info(f"[AutoSave] Periodic save for {len(RUNNING)} script(s)…")
+            for k in list(RUNNING.keys()):
+                try:
+                    _save_running_script_data(k)
+                except Exception as e:
+                    log.warning(f"[AutoSave] {k}: {e}")
+    log.info("[AutoSave] Thread stopped.")
+
 
 def _wipe_ram_key(key):
     """
@@ -1715,6 +1929,14 @@ def kill_script(key, manual_stop=False):
         return
     if manual_stop:
         _autolock_on_stop(key)
+
+    # 💾 STOP SE PEHLE DATA SAVE KARO (pura data vault mein ja sakta hai)
+    try:
+        _save_running_script_data(key)
+        log.info(f"[KillScript] Pre-kill data saved for '{key}'")
+    except Exception as e:
+        log.warning(f"[KillScript] Pre-kill save failed for '{key}': {e}")
+
     try:
         parent = psutil.Process(info["pid"])
         for c in parent.children(recursive=True):
@@ -2433,6 +2655,7 @@ def kb_script_ctrl(fname):
     if running:
         mk.row(_btn("🛑 Stop",  f"stop|{key}"),   _btn("🔄 Restart", f"restart|{key}"))
         mk.row(_btn("📜 Logs",  f"logs|{key}"),   _btn("⌨️ Input",   f"input_req|{key}"))
+        mk.row(_btn("💾 Save Now", f"manual_save|{key}"))   # ← Manual save button
     else:
         mk.row(_btn("▶️ Run",   f"run_key|{key}"),  _btn("📲 Update",  f"update_script|{fname}"))
         mk.row(_btn("📜 Logs",  f"logs|{key}"),     _btn("🗑️ Delete",  f"delete|{fname}"))
@@ -2687,6 +2910,7 @@ def kb_file_action(folder, filename, key):
         if running:
             mk.row(_btn("🛑 Stop",    f"fstop|{key}"),    _btn("🔄 Restart", f"frestart|{key}"))
             mk.row(_btn("📜 Logs",    f"logs|{key}"),      _btn("⌨️ Input",   f"input_req|{key}"))
+            mk.row(_btn("💾 Save Now", f"manual_save|{key}"))   # ← Manual save button
         else:
             mk.row(_btn("▶️ Run",     f"frun|{key}"),      _btn("📲 Update",  f"fupdate|{folder}|{filename}"))
             mk.row(_btn("📜 Logs",    f"logs|{key}"))
@@ -2976,7 +3200,9 @@ def zip_folder_bytes(folder_name: str) -> bytes:
     return buf.getvalue()
 
 def zip_path_to_tmp(path: str) -> str:
-    tmp = tempfile.mktemp(suffix=".zip")
+    # 🔥 FIX (Bug #5): mktemp() TOCTOU race → mkstemp() atomic safe creation
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         if os.path.isfile(path):
             zf.write(path, os.path.basename(path))
@@ -2993,27 +3219,37 @@ def zip_path_to_tmp(path: str) -> str:
 # ══════════════════════════════════════════════════════════════
 def _create_backup_zip() -> str:
     """Create a backup ZIP containing the DB file. Returns temp path."""
-    tmp = tempfile.mktemp(suffix=".zip")
+    # 🔥 FIX (Bug #5): mktemp() TOCTOU race → mkstemp() atomic safe creation
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         if os.path.exists(DB_FILE):
             zf.write(DB_FILE, "vault.db")
     return tmp
 
 def _create_unified_backup_zip() -> str:
-    """Creates a ZIP containing vault.db AND the large_media_vault folder"""
-    tmp = tempfile.mktemp(suffix=".zip")
+    """Creates a ZIP containing vault.db, enc_config marker AND the large_media_vault folder"""
+    # 🔥 FIX (Bug #5): mktemp() TOCTOU race → mkstemp() atomic safe creation
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. Main Database ko ZIP mein daalo
         if os.path.exists(DB_FILE):
             zf.write(DB_FILE, "vault.db")
-            
+
+        # 🔥 FIX (Bug #6): Encryption state marker bhi ZIP mein daalo.
+        # Iske bina restore ke baad bot restart par encryption state lost ho jaati thi
+        # aur plain sqlite3 se encrypted DB open karne ki koshish → "file is not a database".
+        if os.path.exists(_DB_ENCRYPTED_MARKER):
+            zf.write(_DB_ENCRYPTED_MARKER, "vault.db.enc_config")
+
         # 2. Disk files (large_media_vault) ko as it is ZIP mein daalo
         if os.path.exists(LARGE_MEDIA_VAULT):
             for root, dirs, files in os.walk(LARGE_MEDIA_VAULT):
                 for file in files:
                     file_path = os.path.join(root, file)
                     # ZIP ke andar folder structure maintain rahega
-                    arcname = os.path.relpath(file_path, BASE_DIR) 
+                    arcname = os.path.relpath(file_path, BASE_DIR)
                     zf.write(file_path, arcname)
     return tmp
 
@@ -3184,6 +3420,28 @@ def _finish_sqlcipher_restore(tmp_db: str, chat_id: int, key_used: str):
         if os.path.exists(DB_FILE):
             shutil.copy2(DB_FILE, bak)
         os.replace(tmp_db, DB_FILE)
+
+        # 🔥 FIX (Bug #4): Restore ke baad _DB_ENCRYPTED_MARKER update karo.
+        # Nahi kiya toh restart ke baad plain sqlite3 se open karne ki koshish hogi
+        # aur "file is not a database" error aayega — exactly the same as Bug #1.
+        # Restored DB ki pragma profile verify karte waqt pata chali thi — wahi save karo.
+        try:
+            # Incoming DB ki pragma profile detect karo (agar encrypted hai toh)
+            safe_key = (key_used or "").replace("'", "''")
+            _restored_pragmas = [f"PRAGMA key='{safe_key}'"] if _db_verify_file_with_key(DB_FILE, key_used) is not None else []
+            _restored_is_plain = not bool(_restored_pragmas)
+            if not _restored_is_plain:
+                enc_cfg = {"pragmas": [p for p in _restored_pragmas if not p.startswith("PRAGMA key=")]}
+                with open(_DB_ENCRYPTED_MARKER, "w") as _mf:
+                    json.dump(enc_cfg, _mf)
+                os.chmod(_DB_ENCRYPTED_MARKER, 0o600)
+            else:
+                # Plain DB restore hua — marker hata do (agar tha)
+                if os.path.exists(_DB_ENCRYPTED_MARKER):
+                    os.remove(_DB_ENCRYPTED_MARKER)
+        except Exception as _me:
+            log.warning(f"[restore] enc_marker update failed (non-fatal): {_me}")
+
         bot.send_message(chat_id, f"✅ SQLCipher DB restored. Old DB backup: `{os.path.basename(bak)}`\n🔄 Restarting bot…", parse_mode="Markdown")
         time.sleep(2)
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -3271,12 +3529,42 @@ def restore_unified_backup(zip_bytes: bytes, chat_id: int, key: str = None):
                 shutil.copy2(DB_FILE, db_bak)
             os.replace(tmp_db, DB_FILE)
 
+            # 🔥 FIX (Bug #4): Unified restore ke baad bhi _DB_ENCRYPTED_MARKER update karo.
+            # Warna restart ke baad encryption state lost → unlock fail.
+            try:
+                _restored_profile = _db_verify_file_with_key(DB_FILE, use_key)
+                _restored_is_plain = (_restored_profile is not None and len(_restored_profile) == 0)
+                if not _restored_is_plain and _restored_profile is not None:
+                    enc_cfg = {"pragmas": _restored_profile}
+                    with open(_DB_ENCRYPTED_MARKER, "w") as _mf:
+                        json.dump(enc_cfg, _mf)
+                    os.chmod(_DB_ENCRYPTED_MARKER, 0o600)
+                elif _restored_is_plain:
+                    if os.path.exists(_DB_ENCRYPTED_MARKER):
+                        os.remove(_DB_ENCRYPTED_MARKER)
+            except Exception as _me:
+                log.warning(f"[unified_restore] enc_marker update failed (non-fatal): {_me}")
+
             # Replace large_media_vault only after DB verify succeeds.
             if os.path.isdir(LARGE_MEDIA_VAULT):
                 if os.path.exists(media_bak):
                     shutil.rmtree(media_bak)
                 shutil.move(LARGE_MEDIA_VAULT, media_bak)
             os.makedirs(LARGE_MEDIA_VAULT, exist_ok=True)
+
+            # 🔥 FIX (Bug #6 part 2): ZIP ke andar enc_config hai toh restore karo.
+            # Agar Bug #4 fix (DB se re-detect) pehle se kaam kar chuka ho toh
+            # yeh redundant hai, lekin ZIP mein saved config zyada reliable hai
+            # (especially different-password restore mein).
+            if "vault.db.enc_config" in names:
+                try:
+                    enc_cfg_bytes = zf.read("vault.db.enc_config")
+                    with open(_DB_ENCRYPTED_MARKER, "wb") as _ecf:
+                        _ecf.write(enc_cfg_bytes)
+                    os.chmod(_DB_ENCRYPTED_MARKER, 0o600)
+                    log.info("[unified_restore] enc_config restored from ZIP.")
+                except Exception as _ece:
+                    log.warning(f"[unified_restore] enc_config ZIP extract failed (non-fatal): {_ece}")
 
             restored_files = 0
             skipped = 0
@@ -4648,6 +4936,14 @@ def _migrate_plaintext_to_encrypted(chat_id, key: str, sc_module):
         shutil.copy2(DB_FILE, bak)
         os.replace(tmp_encrypted, DB_FILE)
 
+        # 🔥 FIX: Encryption state ko disk par save karo taaki restart ke baad
+        # bhi pata rahe ki DB encrypted hai aur kaun se pragmas use hue the.
+        # Bina iss file ke restart hone par bot plain sqlite3 se try karta tha
+        # → "file is not a database" aur unlock fail hota tha.
+        with open(_DB_ENCRYPTED_MARKER, "w") as _mf:
+            json.dump({"pragmas": target_pragmas, "encrypted_at": datetime.now().isoformat()}, _mf)
+        os.chmod(_DB_ENCRYPTED_MARKER, 0o600)
+
         _DB_IS_PLAINTEXT = False
         _DB_KEY_PRAGMAS = target_pragmas
         bot.send_message(chat_id,
@@ -5265,8 +5561,17 @@ def _process_uploaded_data(cid, m, fname, data: bytes, step):
 
         vault_save("script", fname, data)
         _spam_reset(spam_key)
-        msg = bot.send_message(cid, f"✅ `{fname}` saved to DB.", parse_mode="Markdown",
-                         reply_markup=kb_script_ctrl(fname))
+        # 🔥 FIX: Upload ke baad directly script detail page open karo (files mai)
+        status = "🟢 Running" if is_running(fname) else "🔴 Stopped"
+        txt = (f"📄 *{fname}*\n"
+               f"✅ Uploaded & saved to DB\n"
+               f"Status: {status}")
+        if is_running(fname):
+            info = RUNNING.get(fname, {})
+            mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+            txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+        msg = bot.send_message(cid, txt, parse_mode="Markdown",
+                               reply_markup=kb_script_ctrl(fname))
         _auto_del_track(cid, msg.message_id, _DEL_LONG)
 
     elif s == "upload_zip":
@@ -5341,7 +5646,14 @@ def _process_uploaded_data(cid, m, fname, data: bytes, step):
         old = step.get("fname", fname)
         if is_running(old): kill_script(old)
         vault_save("script", old, data)
-        bot.send_message(cid, f"✅ `{old}` updated.", parse_mode="Markdown",
+        # 🔥 FIX: Plain message ki jagah directly script detail page dikhao
+        status = "🟢 Running" if is_running(old) else "🔴 Stopped"
+        txt = f"✅ *`{old}` updated!*\nStatus: {status}"
+        if is_running(old):
+            info = RUNNING.get(old, {})
+            mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+            txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+        bot.send_message(cid, txt, parse_mode="Markdown",
                          reply_markup=kb_script_ctrl(old))
 
     elif s == "fupdate_file":
@@ -5451,12 +5763,19 @@ def _handle_cb_inner(call):
         if is_running(fname):
             kill_script(fname)
             time.sleep(0.5)
-            run_script(fname, cid)
-            msg = bot.send_message(cid, f"✅ `{fname}` updated + restarted! 🔄", parse_mode="Markdown",
-                             reply_markup=kb_script_ctrl(fname))
-        else:
-            msg = bot.send_message(cid, f"✅ `{fname}` updated.", parse_mode="Markdown",
-                             reply_markup=kb_script_ctrl(fname))
+            threading.Thread(target=run_script,
+                             args=(fname, "script", fname, "", cid), daemon=True).start()
+            time.sleep(1.5)
+        # 🔥 FIX: Script detail page directly dikhao
+        status = "🟢 Running" if is_running(fname) else "🔴 Stopped"
+        action = "updated + restarted 🔄" if status == "🟢 Running" else "updated"
+        txt = f"✅ *`{fname}` {action}*\nStatus: {status}"
+        if is_running(fname):
+            info = RUNNING.get(fname, {})
+            mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+            txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+        msg = bot.send_message(cid, txt, parse_mode="Markdown",
+                               reply_markup=kb_script_ctrl(fname))
         _auto_del_track(cid, msg.message_id, _DEL_LONG)
         return
 
@@ -5466,9 +5785,15 @@ def _handle_cb_inner(call):
         if not pending or pending["fname"] != fname:
             bot.send_message(cid, "⚠️ Confirm session expire ho gaya. Dobara file bhejo."); return
         vault_save("script", fname, pending["data"])
-        msg = bot.send_message(cid,
-            f"✅ `{fname}` saved. Script abhi bhi chal rahi hai (restart nahi hua).",
-            parse_mode="Markdown", reply_markup=kb_script_ctrl(fname))
+        # 🔥 FIX: Script detail page dikhao (script abhi bhi chal rahi hai)
+        status = "🟢 Running" if is_running(fname) else "🔴 Stopped"
+        txt = f"✅ *`{fname}` saved* (restart nahi hua)\nStatus: {status}"
+        if is_running(fname):
+            info = RUNNING.get(fname, {})
+            mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+            txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+        msg = bot.send_message(cid, txt, parse_mode="Markdown",
+                               reply_markup=kb_script_ctrl(fname))
         _auto_del_track(cid, msg.message_id, _DEL_LONG)
         return
 
@@ -5599,15 +5924,22 @@ def _handle_cb_inner(call):
         if not _throttled(key):
             safe_answer(call.id, "⏳ Already starting… thoda ruko.", show_alert=False); return
 
-        # Purane button message ko sirf 'starting' par chhod do
+        # Starting message dikhao
         bot.edit_message_text(f"⏳ `{fname}` is starting…", cid, mid, parse_mode="Markdown")
-        
+
         # Script ko background thread mein start karo
         threading.Thread(target=run_script,
                          args=(key, "script", fname, "", cid), daemon=True).start()
-        
-        # 🔥 Yahan se time.sleep aur _eorsend hata diya gaya hai
-        # Naya Control Panel ab direct 'run_script' function bheja karega
+
+        # 🔥 FIX: Original message wapas update karo Run/Stop/Logs buttons ke saath
+        time.sleep(1.5)
+        status = "🟢 Running" if is_running(key) else "🔴 Stopped"
+        txt = f"📄 *{fname}*\nStatus: {status}"
+        if is_running(key):
+            info = RUNNING.get(key, {})
+            mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+            txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+        _eorsend(cid, mid, txt, reply_markup=kb_script_ctrl(fname))
         return
         
     if data == "run_all_scripts":
@@ -5640,20 +5972,69 @@ def _handle_cb_inner(call):
         _auto_del_track(cid, mid, _DEL_TEMP)
         return
 
+    # ── 💾 MANUAL SAVE CALLBACK ──
+    if data.startswith("manual_save|"):
+        key   = data[12:]
+        fname = os.path.basename(key)
+        if not is_running(key):
+            safe_answer(call.id, "ℹ️ Script chal nahi rahi — save karne ko kuch nahi.", show_alert=True)
+            return
+        safe_answer(call.id, "💾 Saving…", show_alert=False)
+        try:
+            saved_files = _save_running_script_data(key)
+            if saved_files:
+                msg = (f"💾 *Manual Save — `{fname}`*\n"
+                       f"✅ {len(saved_files)} file(s) saved:\n" +
+                       "\n".join(f"  `{s}`" for s in saved_files))
+            else:
+                msg = f"💾 *Manual Save — `{fname}`*\nℹ️ Koi nayi/changed file nahi mili."
+        except Exception as e:
+            msg = f"❌ Save failed: `{e}`"
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        bot.send_message(cid, msg, parse_mode="Markdown")
+        return
+
     if data.startswith("restart|"):
         key   = data[8:]
         fname = os.path.basename(key)
         if not _throttled(key):
             safe_answer(call.id, "⏳ Already restarting… thoda ruko.", show_alert=False); return
-        info  = RUNNING.get(key, {})
-        kill_script(key); time.sleep(0.5)
+        kill_script(key)
+        # Restarting message dikhao
+        try:
+            bot.edit_message_text(f"🔄 `{fname}` restarting…", cid, mid, parse_mode="Markdown")
+        except Exception:
+            pass
+        time.sleep(0.5)
         if "/" in key:
             folder, filename = key.split("/", 1)
             threading.Thread(target=run_script,
                              args=(key, "folder_file", filename, folder, cid), daemon=True).start()
+            # 🔥 FIX: Original message update karo status ke saath
+            time.sleep(1.5)
+            status = "🟢 Running" if is_running(key) else "🔴 Stopped"
+            base_name = os.path.basename(filename)
+            txt = f"📄 *{base_name}*\n📂 Path: `{folder}/{filename}`\nStatus: {status}"
+            if is_running(key):
+                info = RUNNING.get(key, {})
+                mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+                txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+            _eorsend(cid, mid, txt, reply_markup=kb_file_action(folder, filename, key))
         else:
             threading.Thread(target=run_script,
                              args=(key, "script", fname, "", cid), daemon=True).start()
+            # 🔥 FIX: Original message update karo status ke saath
+            time.sleep(1.5)
+            status = "🟢 Running" if is_running(key) else "🔴 Stopped"
+            txt = f"📄 *{fname}*\nStatus: {status}"
+            if is_running(key):
+                info = RUNNING.get(key, {})
+                mins = (datetime.now() - info.get("start", datetime.now())).seconds // 60
+                txt += f"\n⏱ {mins}m | PID: {info.get('pid', 'N/A')}"
+            _eorsend(cid, mid, txt, reply_markup=kb_script_ctrl(fname))
         return
 
     if data.startswith("delete|"):
@@ -5987,7 +6368,9 @@ def _handle_cb_inner(call):
             sname, _ = _get_active_userbot()
             if sname and PYROGRAM_AVAILABLE:
                 bot.send_message(cid, f"📤 Large file — userbot se bhej raha hun…")
-                tmp = tempfile.mktemp(suffix=os.path.splitext(fname)[1])
+                # 🔥 FIX (Bug #5): mktemp() TOCTOU race → mkstemp()
+                _fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(fname)[1])
+                os.close(_fd)
                 with open(tmp, "wb") as f: f.write(raw)
                 def _big(sn=sname, t=tmp, fn=fname):
                     try: _userbot_upload_thread(sn, cid, t, f"📄 `{fn}`")
@@ -6103,7 +6486,9 @@ def _handle_cb_inner(call):
                 con.close()
                 return
                 
-            tmp = tempfile.mktemp(suffix=".csv")
+            # 🔥 FIX (Bug #5): mktemp() TOCTOU race → mkstemp()
+            _fd, tmp = tempfile.mkstemp(suffix=".csv")
+            os.close(_fd)
             with open(tmp, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(col_names) # Heading daalna
@@ -6732,6 +7117,20 @@ def _handle_cb_inner(call):
 
 
 def _cleanup_all():
+    # 💾 STEP 1: Pehle saare running scripts ka data save karo
+    # (kill_script ke andar bhi save hota hai, lekin ye extra guarantee hai
+    #  agar kill_script kisi reason se skip ho jaye)
+    try:
+        _save_all_running_data(log_prefix="Shutdown")
+    except Exception as e:
+        log.warning(f"[Shutdown] _save_all_running_data failed: {e}")
+
+    # ⏹ Auto-save thread band karo
+    try:
+        _AUTOSAVE_STOP_EVT.set()
+    except Exception:
+        pass
+
     # 🔒 SECURITY HARDENING: Secure memory wipe on exit
     # _DB_KEY aur AES key ko memory se zero-out karo taaki
     # process exit ke baad RAM dumps mein easily na milein.
@@ -6776,7 +7175,35 @@ def _cleanup_all():
         pass
 
 atexit.register(_cleanup_all)
+
+# ── SIGTERM handler (systemd / kill command) ──
+# sys.exit(0) → atexit → _cleanup_all → data save + process kill
 signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+
+# ── SIGINT handler (Ctrl+C) ──
+# Python default Ctrl+C sirf KeyboardInterrupt raise karta hai lekin
+# agar atexit ke andar exception aaye to data save skip ho sakta tha.
+# Yahan explicitly data save karte hain PEHLE, phir exit.
+def _sigint_handler(signum, frame):
+    print("\n⏳ Ctrl+C detected — saving all running data before exit…")
+    try:
+        _save_all_running_data(log_prefix="SIGINT")
+    except Exception as e:
+        print(f"⚠️ Data save error on SIGINT: {e}")
+    sys.exit(0)  # → atexit → _cleanup_all (double-save guard built-in)
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+# ── Auto-save background thread ──
+# Har 3 minute (180s) mein saare running scripts ke changed files vault mein save hote hain.
+# Interval badlna ho toh: _autosave_loop(interval_seconds=300) — 5 minute
+_autosave_thread = threading.Thread(
+    target=_autosave_loop,
+    args=(180,),   # ← interval in seconds — change karo as needed
+    name="AutoSaveDaemon",
+    daemon=True    # Main thread band ho to ye bhi band ho jata hai
+)
+_autosave_thread.start()
 
 
 # ══════════════════════════════════════════════════════════════
